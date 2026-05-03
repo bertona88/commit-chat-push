@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -30,6 +31,15 @@ SECRET_PATTERNS = [
 ]
 
 
+@dataclass(frozen=True)
+class SessionCandidate:
+    path_score: int
+    anchor_match: bool
+    mtime: float
+    path: Path
+    meta: dict[str, Any]
+
+
 def parse_args() -> argparse.Namespace:
     default_root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
     parser = argparse.ArgumentParser(
@@ -38,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo", default=os.getcwd(), help="Repository path used to select a matching session.")
     parser.add_argument("--sessions-root", default=str(default_root), help="Root containing Codex session JSONL files.")
     parser.add_argument("--session", help="Specific Codex JSONL session to export.")
+    parser.add_argument("--anchor", help="Prefer a session JSONL containing this exact marker text.")
+    parser.add_argument("--require-anchor", action="store_true", help="Fail unless the selected session contains --anchor.")
     parser.add_argument("--output-dir", default="docs/codex-sessions", help="Directory for generated transcript.")
     parser.add_argument("--output", help="Exact Markdown output path. Overrides --output-dir.")
     parser.add_argument("--title", help="Transcript title. Defaults to the Codex thread name or first user message.")
@@ -97,8 +109,33 @@ def path_score(repo: Path, cwd_text: str | None) -> int:
     return 0
 
 
-def find_session(sessions_root: Path, repo: Path) -> tuple[Path, dict[str, Any], bool]:
-    candidates: list[tuple[int, float, Path, dict[str, Any]]] = []
+def file_contains_text(path: Path, needle: str | None) -> bool:
+    if not needle:
+        return False
+    tail = ""
+    keep = max(len(needle) - 1, 0)
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    return False
+                text = tail + chunk
+                if needle in text:
+                    return True
+                tail = text[-keep:] if keep else ""
+    except OSError:
+        return False
+
+
+def find_session(
+    sessions_root: Path,
+    repo: Path,
+    *,
+    anchor: str | None = None,
+    require_anchor: bool = False,
+) -> tuple[Path, dict[str, Any], bool, bool]:
+    candidates: list[SessionCandidate] = []
     for path in sessions_root.rglob("*.jsonl"):
         meta = first_session_meta(path)
         score = path_score(repo, meta.get("cwd"))
@@ -106,12 +143,38 @@ def find_session(sessions_root: Path, repo: Path) -> tuple[Path, dict[str, Any],
             mtime = path.stat().st_mtime
         except OSError:
             mtime = 0
-        candidates.append((score, mtime, path, meta))
+        candidates.append(
+            SessionCandidate(
+                path_score=score,
+                anchor_match=file_contains_text(path, anchor),
+                mtime=mtime,
+                path=path,
+                meta=meta,
+            )
+        )
     if not candidates:
         raise SystemExit(f"No Codex sessions found under {sessions_root}")
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    score, _, path, meta = candidates[0]
-    return path, meta, score > 0
+    if require_anchor:
+        if not anchor:
+            raise SystemExit("--require-anchor needs --anchor")
+        candidates = [candidate for candidate in candidates if candidate.anchor_match]
+        if not candidates:
+            raise SystemExit(f"No Codex sessions under {sessions_root} contain anchor: {anchor!r}")
+    candidates.sort(
+        key=lambda item: (1 if item.anchor_match else 0, item.path_score, item.mtime),
+        reverse=True,
+    )
+    candidate = candidates[0]
+    return candidate.path, candidate.meta, candidate.path_score > 0, candidate.anchor_match
+
+
+def session_anchor_match(path: Path, anchor: str | None, require_anchor: bool) -> bool:
+    if require_anchor and not anchor:
+        raise SystemExit("--require-anchor needs --anchor")
+    matched = file_contains_text(path, anchor)
+    if require_anchor and not matched:
+        raise SystemExit(f"Session file does not contain anchor: {path}")
+    return matched
 
 
 def sha256_file(path: Path) -> str:
@@ -298,6 +361,7 @@ def render_markdown(
     session_path: Path,
     meta: dict[str, Any],
     matched_repo: bool,
+    anchor_matched: bool,
     args: argparse.Namespace,
 ) -> str:
     messages = iter_message_records(events)
@@ -320,6 +384,9 @@ def render_markdown(
             f"- Repository match: `{'yes' if matched_repo else 'not confirmed'}`",
         ]
     )
+    if args.anchor:
+        lines.append(f"- Selection anchor: `{redact(str(args.anchor), enabled=redaction_enabled)}`")
+        lines.append(f"- Anchor match: `{'yes' if anchor_matched else 'not found'}`")
     if args.include_local_paths and meta.get("cwd"):
         lines.append(f"- Session cwd: `{redact(str(meta.get('cwd')), enabled=redaction_enabled)}`")
     if invalid_lines:
@@ -387,8 +454,14 @@ def main() -> int:
         session_path = Path(args.session).expanduser()
         meta = first_session_meta(session_path)
         matched = path_score(repo, meta.get("cwd")) > 0
+        anchor_matched = session_anchor_match(session_path, args.anchor, args.require_anchor)
     else:
-        session_path, meta, matched = find_session(Path(args.sessions_root).expanduser(), repo)
+        session_path, meta, matched, anchor_matched = find_session(
+            Path(args.sessions_root).expanduser(),
+            repo,
+            anchor=args.anchor,
+            require_anchor=args.require_anchor,
+        )
     if not session_path.exists():
         raise SystemExit(f"Session file does not exist: {session_path}")
     events, invalid = read_jsonl(session_path)
@@ -405,12 +478,15 @@ def main() -> int:
         session_path=session_path,
         meta=meta,
         matched_repo=matched,
+        anchor_matched=anchor_matched,
         args=args,
     )
     output_path.write_text(markdown, encoding="utf-8")
     print(output_path)
     if not matched:
         print("warning: selected session did not clearly match the requested repo", file=sys.stderr)
+    if args.anchor and not anchor_matched:
+        print("warning: selected session did not contain the requested anchor", file=sys.stderr)
     return 0
 
 
